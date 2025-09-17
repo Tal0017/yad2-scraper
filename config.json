@@ -1,10 +1,9 @@
 {
-  "telegramApiToken": null,
-  "chatId": null,
   "projects": [
     {
-      "topic": "",
-      "url": ""
+      "topic": "My Yad2 Search",
+      "url": "https://www.yad2.co.il/realestate/rent?minPrice=3000&maxPrice=8500&minRooms=2&maxRooms=3&multiNeighborhood=1461%2C1483%2C1519
+"
     }
   ]
 }
