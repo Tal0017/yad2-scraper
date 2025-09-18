@@ -7,7 +7,14 @@ const getYad2Response = async (url) => {
     const requestOptions = { method: 'GET', redirect: 'follow' };
     try {
         const res = await fetch(url, requestOptions);
-        return await res.text();
+        const text = await res.text();
+
+        // Debug: print first 500 chars of HTML to see what we get
+        console.log("\n=== Yad2 HTML preview ===");
+        console.log(text.substring(0, 500));
+        console.log("=== End preview ===\n");
+
+        return text;
     } catch (err) {
         console.log(err);
     }
@@ -20,16 +27,22 @@ const scrapeItemsAndExtractImgUrls = async (url) => {
     const $ = cheerio.load(yad2Html);
     const titleText = $("title").first().text();
 
-    if (titleText === "ShieldSquare Captcha") throw new Error("Bot detection");
+    if (titleText === "ShieldSquare Captcha") {
+        console.log("❌ Bot detection page received");
+        throw new Error("Bot detection");
+    }
 
-    const $feedItems = $(".feeditem").find(".pic");
-    if (!$feedItems) throw new Error("Could not find feed items");
+    // Try to select the images
+    const $feedItems = $(".feeditem .pic img");
+    console.log(`Found ${$feedItems.length} images on page`);
 
     const imageUrls = [];
     $feedItems.each((_, elm) => {
-        const imgSrc = $(elm).find("img").attr('src');
+        const imgSrc = $(elm).attr("src");
         if (imgSrc) imageUrls.push(imgSrc);
     });
+
+    console.log("Extracted image URLs:", imageUrls);
 
     return imageUrls;
 }
