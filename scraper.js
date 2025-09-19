@@ -28,12 +28,12 @@ async function safeSend(telenode, chatId, text, { maxRetries = 5 } = {}) {
       if (status === 429 && attempt < maxRetries) {
         const waitMs = Number.isFinite(retryAfterSec)
           ? retryAfterSec * 1000
-          : (1000 * Math.pow(2, attempt)); // fallback exponential backoff
+          : (1000 * Math.pow(2, attempt));
         await sleep(waitMs);
         attempt += 1;
         continue;
       }
-      throw e; // preserve original error when not 429 or retries exhausted
+      throw e;
     }
   }
 }
@@ -92,8 +92,6 @@ const scrapeItemsAndExtractImgUrls = async (url) => {
   const items = [];
   $feedItems.each((_, elm) => {
     const imgSrc = $(elm).attr('src')?.trim();
-
-    // Find the closest parent <a> to get the ad URL
     const parentLink = $(elm).closest('a').attr('href');
     const fullLink = parentLink ? new URL(parentLink, 'https://www.yad2.co.il').href : null;
 
@@ -112,7 +110,6 @@ const scrapeItemsAndExtractImgUrls = async (url) => {
 function ensureDir(dirPath) {
   if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
 }
-
 function readJsonArray(filePath) {
   if (!fs.existsSync(filePath)) return [];
   try {
@@ -123,7 +120,6 @@ function readJsonArray(filePath) {
     return [];
   }
 }
-
 function writeJson(filePath, data) {
   ensureDir(path.dirname(filePath));
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
@@ -160,32 +156,66 @@ const createPushFlagForWorkflow = () => {
 };
 
 // ================================
-// Notification helpers (batch + limit-safe)
+// Telegram-safe batching by characters
 // ================================
-function chunk(arr, size) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-  return out;
+const MAX_CHARS = 3900; // stay safely below Telegram's ~4096 limit
+
+function shortenLink(u) {
+  try {
+    const url = new URL(u);
+    // Drop query to keep it short but clickable
+    return url.origin + url.pathname;
+  } catch {
+    return String(u).split('?')[0];
+  }
+}
+
+/**
+ * Split a list of lines into chunks whose full message length (header + lines)
+ * stays within MAX_CHARS. Keeps whole lines; never splits inside a line.
+ */
+function chunkLinesByChars(lines, baseHeader, maxChars = MAX_CHARS) {
+  const chunks = [];
+  let curr = [];
+  let currLen = baseHeader.length + 2; // header + \n\n
+
+  for (const line of lines) {
+    const lineLen = line.length + 1; // + newline
+    // leave room (≈40 chars) for " (part X/Y)" suffix we add later
+    const reserve = 40;
+    if (currLen + lineLen > (maxChars - reserve)) {
+      if (curr.length === 0) {
+        // single super-long line; hard truncate to fit
+        const truncated = line.slice(0, maxChars - baseHeader.length - reserve - 10) + '…';
+        chunks.push([truncated]);
+        curr = [];
+        currLen = baseHeader.length + 2;
+      } else {
+        chunks.push(curr);
+        curr = [line];
+        currLen = baseHeader.length + 2 + lineLen;
+      }
+    } else {
+      curr.push(line);
+      currLen += lineLen;
+    }
+  }
+  if (curr.length) chunks.push(curr);
+  return chunks;
 }
 
 async function notifyNewItems(telenode, chatId, newItems) {
   if (!newItems || newItems.length === 0) return;
 
-  // Build lines like: "• URL — IMG"
-  const lines = newItems.map((it) => `• ${it.link} — ${it.image}`);
-  const header = `🆕 New items found (${newItems.length}):\n\n`;
-  const fullText = header + lines.join('\n');
+  // Keep messages short: only show the ad link (drop the image URL)
+  const lines = newItems.map(it => `• ${shortenLink(it.link)}`);
 
-  // Telegram text limit safety
-  if (fullText.length <= 4000) {
-    await safeSend(telenode, chatId, fullText);
-    return;
-  }
+  const baseHeader = `🆕 New items found (${newItems.length})`;
+  const groups = chunkLinesByChars(lines, baseHeader, MAX_CHARS);
 
-  // Split by count if too long
-  const groups = chunk(lines, 40); // adjust chunk size if needed
   for (let i = 0; i < groups.length; i++) {
-    const text = `🆕 New items (part ${i + 1}/${groups.length}):\n\n${groups[i].join('\n')}`;
+    const partTag = groups.length > 1 ? ` (part ${i + 1}/${groups.length})` : '';
+    const text = `${baseHeader}${partTag}\n\n${groups[i].join('\n')}`;
     await safeSend(telenode, chatId, text);
   }
 }
@@ -213,10 +243,8 @@ const scrape = async (topic, url) => {
     const errMsg = e?.message ? `Error: ${e.message}` : 'Unknown error';
     try {
       await safeSend(telenode, chatId, `Scan workflow failed... 😥\n${errMsg}`);
-    } catch {
-      // Ignore if even safeSend fails after retries; just log.
-    }
-    throw e; // keep original stack
+    } catch {}
+    throw e;
   }
 };
 
