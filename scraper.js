@@ -31,7 +31,7 @@ const getYad2Response = async (url) => {
 };
 
 // ================================
-// Scrape Image URLs
+// Scrape Items (image + ad URL)
 // ================================
 const scrapeItemsAndExtractImgUrls = async (url) => {
     const yad2Html = await getYad2Response(url);
@@ -44,8 +44,7 @@ const scrapeItemsAndExtractImgUrls = async (url) => {
         throw new Error("Bot detection triggered!");
     }
 
-    // UPDATED SELECTOR:
-    // Target ads by stable attribute
+    // Select all ad images
     const $feedItems = $('img[data-nagish="feed-item-image"]');
 
     console.log(`Found ${$feedItems.length} feed images`);
@@ -54,27 +53,37 @@ const scrapeItemsAndExtractImgUrls = async (url) => {
         throw new Error("Could not find feed items on the page");
     }
 
-    const imageUrls = [];
+    const items = [];
     $feedItems.each((_, elm) => {
-        const imgSrc = $(elm).attr('src');
-        if (imgSrc) {
-            imageUrls.push(imgSrc.trim());
+        const imgSrc = $(elm).attr('src')?.trim();
+
+        // Find the closest parent <a> to get the ad URL
+        const parentLink = $(elm).closest('a').attr('href');
+        const fullLink = parentLink
+            ? new URL(parentLink, 'https://www.yad2.co.il').href
+            : null;
+
+        if (imgSrc && fullLink) {
+            items.push({
+                image: imgSrc,
+                link: fullLink
+            });
         }
     });
 
-    console.log("Extracted image URLs:", imageUrls);
-    return imageUrls;
+    console.log("Extracted items:", items);
+    return items;
 };
 
 // ================================
 // Check for New Items
 // ================================
-const checkIfHasNewItem = async (imgUrls, topic) => {
+const checkIfHasNewItem = async (items, topic) => {
     const filePath = `./data/${topic}.json`;
-    let savedUrls = [];
+    let savedLinks = [];
 
     try {
-        savedUrls = require(filePath);
+        savedLinks = require(filePath);
     } catch (e) {
         if (e.code === "MODULE_NOT_FOUND") {
             if (!fs.existsSync('data')) fs.mkdirSync('data');
@@ -86,15 +95,16 @@ const checkIfHasNewItem = async (imgUrls, topic) => {
     }
 
     let newItems = [];
-    imgUrls.forEach(url => {
-        if (!savedUrls.includes(url)) {
-            savedUrls.push(url);
-            newItems.push(url);
+    items.forEach(item => {
+        // Identify uniqueness by the ad link
+        if (item.link && !savedLinks.includes(item.link)) {
+            savedLinks.push(item.link);
+            newItems.push(item);
         }
     });
 
     if (newItems.length > 0) {
-        fs.writeFileSync(filePath, JSON.stringify(savedUrls, null, 2));
+        fs.writeFileSync(filePath, JSON.stringify(savedLinks, null, 2));
         await createPushFlagForWorkflow();
     }
 
@@ -124,7 +134,10 @@ const scrape = async (topic, url) => {
 
         if (newItems.length > 0) {
             for (const item of newItems) {
-                await telenode.sendTextMessage(`New item:\n${item}`, chatId);
+                await telenode.sendTextMessage(
+                    `🆕 New item found!\n\nImage: ${item.image}\nURL: ${item.link}`,
+                    chatId
+                );
             }
         } else {
             await telenode.sendTextMessage("No new items were added", chatId);
