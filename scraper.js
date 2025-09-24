@@ -39,6 +39,11 @@ async function safeSend(telenode, chatId, text, { maxRetries = 5 } = {}) {
 }
 
 // ================================
+/** Basic logging helpers */
+function info(...a) { console.log('[INFO]', ...a); }
+function warn(...a) { console.warn('[WARN]', ...a); }
+
+// ================================
 // Fetch Yad2 Page
 // ================================
 const getYad2Response = async (url) => {
@@ -54,65 +59,13 @@ const getYad2Response = async (url) => {
     const res = await fetch(url, requestOptions);
     const text = await res.text();
 
-    // Debug: preview the first 500 characters
-    console.log('\n=== HTML Preview ===');
-    console.log(text.substring(0, 500));
-    console.log('=== End Preview ===\n');
-
+    // Debug (short)
+    info('Fetched HTML length:', text.length);
     return text;
   } catch (err) {
     console.log('❌ Error fetching Yad2:', err);
     throw err;
   }
-};
-
-// ================================
-// Scrape Items (image + ad URL)
-// ================================
-const scrapeItemsAndExtractImgUrls = async (url) => {
-  const yad2Html = await getYad2Response(url);
-  if (!yad2Html) throw new Error('Could not get Yad2 response');
-
-  const $ = cheerio.load(yad2Html);
-  const titleText = $('title').first().text();
-
-  if (titleText === 'ShieldSquare Captcha') {
-    throw new Error('Bot detection triggered!');
-  }
-
-  // Select all ad images
-  const $feedItems = $('img[data-nagish="feed-item-image"]');
-
-  console.log(`Found ${$feedItems.length} feed images`);
-
-  if ($feedItems.length === 0) {
-    throw new Error('Could not find feed items on the page');
-  }
-
-  const items = [];
-  $feedItems.each((_, elm) => {
-    const imgSrc = $(elm).attr('src')?.trim();
-    const parentLink = $(elm).closest('a').attr('href');
-    const fullLink = parentLink ? new URL(parentLink, 'https://www.yad2.co.il').href : null;
-
-    if (imgSrc && fullLink) {
-      items.push({ image: imgSrc, link: fullLink });
-    }
-  });
-
-  // Deduplicate within this scrape pass (same ad can repeat on page)
-  const seenRun = new Set();
-  const uniqueItems = [];
-  for (const it of items) {
-    const id = getItemId(it.link);
-    if (!id) continue;
-    if (seenRun.has(id)) continue;
-    seenRun.add(id);
-    uniqueItems.push(it);
-  }
-
-  console.log('Extracted unique items:', uniqueItems);
-  return uniqueItems;
 };
 
 // ================================
@@ -135,10 +88,14 @@ function writeJson(filePath, data) {
   ensureDir(path.dirname(filePath));
   fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
 }
+function fileExists(filePath) {
+  try { return fs.existsSync(filePath); } catch { return false; }
+}
 
 // ================================
-// Extract stable item ID from URL
+// URL helpers
 // ================================
+/** Extract stable Yad2 item ID from URL path: .../item/XXXXX */
 function getItemId(u) {
   try {
     const { pathname } = new URL(u);
@@ -149,16 +106,146 @@ function getItemId(u) {
   }
 }
 
+/** Shorten for display (drop query) */
+function shortenLink(u) {
+  try {
+    const url = new URL(u);
+    return url.origin + url.pathname;
+  } catch {
+    return String(u).split('?')[0];
+  }
+}
+
+/**
+ * Build a page URL using a "page" query param (1-based).
+ * If page === 1, return base as-is.
+ */
+function buildPageUrl(baseUrl, page) {
+  if (page <= 1) return baseUrl;
+  try {
+    const u = new URL(baseUrl);
+    // common param name is often "page"
+    u.searchParams.set('page', String(page));
+    return u.toString();
+  } catch {
+    // If baseUrl is not absolute, try to prefix
+    return `${baseUrl}${baseUrl.includes('?') ? '&' : '?'}page=${page}`;
+  }
+}
+
+// Try to detect a "next" link in the DOM (best-effort)
+function detectNextPageUrl($, currentUrl) {
+  // rel="next"
+  let href = $('a[rel="next"]').attr('href');
+  if (!href) {
+    // common "Next" patterns (Hebrew "הבא")
+    href = $('a:contains("Next"), a:contains("הבא"), a.pagination__next, a.page-link.next').attr('href');
+  }
+  if (!href) return null;
+  try {
+    return new URL(href, currentUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
 // ================================
-// Check for New Items (ID-based)
+// Scrape Items (image + ad URL) from ONE page
 // ================================
-const checkIfHasNewItem = async (items, topic) => {
+async function scrapeItemsFromSinglePage(url) {
+  const yad2Html = await getYad2Response(url);
+  if (!yad2Html) throw new Error('Could not get Yad2 response');
+
+  const $ = cheerio.load(yad2Html);
+  const titleText = $('title').first().text();
+  if (titleText === 'ShieldSquare Captcha') {
+    throw new Error('Bot detection triggered!');
+  }
+
+  // Select all ad images; anchor parent should hold the ad link
+  const $feedItems = $('img[data-nagish="feed-item-image"]');
+  info(`Found ${$feedItems.length} feed images on ${shortenLink(url)}`);
+
+  const items = [];
+  $feedItems.each((_, elm) => {
+    const imgSrc = $(elm).attr('src')?.trim();
+    const parentLink = $(elm).closest('a').attr('href');
+    const fullLink = parentLink ? new URL(parentLink, 'https://www.yad2.co.il').href : null;
+    if (imgSrc && fullLink) {
+      items.push({ image: imgSrc, link: fullLink });
+    }
+  });
+
+  // Deduplicate within this page by ID
+  const seenRun = new Set();
+  const uniqueItems = [];
+  for (const it of items) {
+    const id = getItemId(it.link);
+    if (!id) continue;
+    if (seenRun.has(id)) continue;
+    seenRun.add(id);
+    uniqueItems.push(it);
+  }
+
+  const nextUrl = detectNextPageUrl($, url); // may be null
+  return { items: uniqueItems, nextUrl };
+}
+
+// ================================
+// Collect multiple pages per topic
+// ================================
+async function collectItemsAcrossPages(baseUrl, maxPages) {
+  const aggregated = [];
+  const seenIds = new Set();
+
+  let pageUrl = baseUrl;
+  let usedDetectedNext = false;
+
+  for (let p = 1; p <= maxPages; p++) {
+    // Build page URL if we are not following detected next links
+    const targetUrl = usedDetectedNext ? pageUrl : buildPageUrl(baseUrl, p);
+
+    try {
+      const { items, nextUrl } = await scrapeItemsFromSinglePage(targetUrl);
+
+      // Aggregate with run-level dedupe by ID
+      for (const it of items) {
+        const id = getItemId(it.link);
+        if (!id) continue;
+        if (seenIds.has(id)) continue;
+        seenIds.add(id);
+        aggregated.push(it);
+      }
+
+      // Prefer detected next if available (some sites need it); switch into "follow-next" mode
+      if (nextUrl && p < maxPages) {
+        pageUrl = nextUrl;
+        usedDetectedNext = true;
+      } else if (usedDetectedNext && !nextUrl) {
+        // We were following "next" but there's no more
+        break;
+      }
+    } catch (e) {
+      warn(`Page ${p} failed: ${e?.message || e}`);
+      // Continue to next page try (sometimes randomization or throttling fails)
+      continue;
+    }
+  }
+
+  info(`Collected ${aggregated.length} unique items across up to ${maxPages} pages`);
+  return aggregated;
+}
+
+// ================================
+// Check for New Items (ID-based, multi-page aware)
+// ================================
+const checkIfHasNewItem = async (items, topic, { bootstrapIfEmpty = true } = {}) => {
   const filePath = `./data/${topic}_ids.json`;
 
-  // Load previous values (could be old links or new IDs)
+  const existedBefore = fileExists(filePath);
   const prev = readJsonArray(filePath);
 
-  // Migrate: if we detect URLs, convert them to IDs
+  // Migrate: if we detect URLs, convert them to IDs; otherwise assume IDs already
   const migrated = prev.map(v => {
     if (typeof v === 'string' && /^https?:\/\//i.test(v)) {
       const id = getItemId(v);
@@ -169,19 +256,38 @@ const checkIfHasNewItem = async (items, topic) => {
 
   const knownIds = new Set(migrated.filter(Boolean).map(String));
 
+  // Build encountered IDs & new items list
   const newItems = [];
   for (const item of items) {
     const id = getItemId(item.link);
     if (!id) continue;
     if (!knownIds.has(id)) {
-      knownIds.add(id);
       newItems.push(item);
     }
   }
 
+  // If bootstrap mode and no previous history, save but don't send
+  if ((!existedBefore || knownIds.size === 0) && bootstrapIfEmpty) {
+    const allIds = new Set();
+    for (const it of items) {
+      const id = getItemId(it.link);
+      if (id) allIds.add(id);
+    }
+    writeJson(filePath, Array.from(allIds).slice(-10000)); // keep 10k
+    info(`Bootstrap: saved ${allIds.size} IDs for topic "${topic}", sending 0.`);
+    return [];
+  }
+
+  // Merge newly encountered IDs into known and persist
+  if (items.length > 0) {
+    for (const it of items) {
+      const id = getItemId(it.link);
+      if (id) knownIds.add(id);
+    }
+    writeJson(filePath, Array.from(knownIds).slice(-10000)); // keep 10k
+  }
+
   if (newItems.length > 0) {
-    const idsToSave = Array.from(knownIds).slice(-5000); // keep last 5k
-    writeJson(filePath, idsToSave);
     createPushFlagForWorkflow();
   }
 
@@ -200,23 +306,14 @@ const createPushFlagForWorkflow = () => {
 // ================================
 const MAX_CHARS = 3900;
 
-function shortenLink(u) {
-  try {
-    const url = new URL(u);
-    return url.origin + url.pathname;
-  } catch {
-    return String(u).split('?')[0];
-  }
-}
-
 function chunkLinesByChars(lines, baseHeader, maxChars = MAX_CHARS) {
   const chunks = [];
   let curr = [];
-  let currLen = baseHeader.length + 2;
+  let currLen = baseHeader.length + 2; // header + \n\n
 
   for (const line of lines) {
-    const lineLen = line.length + 1;
-    const reserve = 40;
+    const lineLen = line.length + 1; // + newline
+    const reserve = 40; // leave room for "(part X/Y)"
     if (currLen + lineLen > (maxChars - reserve)) {
       if (curr.length === 0) {
         const truncated = line.slice(0, maxChars - baseHeader.length - reserve - 10) + '…';
@@ -255,16 +352,16 @@ async function notifyNewItems(telenode, chatId, newItems) {
 // ================================
 // Main Scrape Workflow
 // ================================
-const scrape = async (topic, url) => {
+const scrape = async (topic, url, pagesToScan, bootstrapIfEmpty = true) => {
   const apiToken = process.env.API_TOKEN || config.telegramApiToken;
   const chatId = process.env.CHAT_ID || config.chatId;
   const telenode = new Telenode({ apiToken });
 
   try {
-    await safeSend(telenode, chatId, `Starting scanning ${topic} on link:\n${url}`);
+    await safeSend(telenode, chatId, `Scanning **${topic}** across up to ${pagesToScan} page(s):\n${url}`);
 
-    const scrapeImgResults = await scrapeItemsAndExtractImgUrls(url);
-    const newItems = await checkIfHasNewItem(scrapeImgResults, topic);
+    const allItems = await collectItemsAcrossPages(url, pagesToScan);
+    const newItems = await checkIfHasNewItem(allItems, topic, { bootstrapIfEmpty });
 
     if (newItems.length > 0) {
       await notifyNewItems(telenode, chatId, newItems);
@@ -284,13 +381,19 @@ const scrape = async (topic, url) => {
 // Entry Point
 // ================================
 const program = async () => {
+  const defaultPages = Number(config.defaultPages) || 3;
+  const bootstrapIfEmpty = config.bootstrapIfEmpty !== false; // default true
+
   await Promise.all(
     (config.projects || [])
       .filter((project) => {
-        if (project.disabled) console.log(`Topic "${project.topic}" is disabled. Skipping.`);
+        if (project.disabled) info(`Topic "${project.topic}" is disabled. Skipping.`);
         return !project.disabled;
       })
-      .map((project) => scrape(project.topic, project.url))
+      .map((project) => {
+        const pages = Number(project.pages) || defaultPages;
+        return scrape(project.topic, project.url, pages, bootstrapIfEmpty);
+      })
   );
 };
 
