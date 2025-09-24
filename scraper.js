@@ -100,8 +100,19 @@ const scrapeItemsAndExtractImgUrls = async (url) => {
     }
   });
 
-  console.log('Extracted items:', items);
-  return items;
+  // Deduplicate within this scrape pass (same ad can repeat on page)
+  const seenRun = new Set();
+  const uniqueItems = [];
+  for (const it of items) {
+    const id = getItemId(it.link);
+    if (!id) continue;
+    if (seenRun.has(id)) continue;
+    seenRun.add(id);
+    uniqueItems.push(it);
+  }
+
+  console.log('Extracted unique items:', uniqueItems);
+  return uniqueItems;
 };
 
 // ================================
@@ -126,22 +137,51 @@ function writeJson(filePath, data) {
 }
 
 // ================================
-// Check for New Items
+// Extract stable item ID from URL
+// ================================
+function getItemId(u) {
+  try {
+    const { pathname } = new URL(u);
+    const m = pathname.match(/\/item\/([A-Za-z0-9_-]+)/i);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// ================================
+// Check for New Items (ID-based)
 // ================================
 const checkIfHasNewItem = async (items, topic) => {
-  const filePath = `./data/${topic}.json`;
-  let savedLinks = readJsonArray(filePath);
+  const filePath = `./data/${topic}_ids.json`;
+
+  // Load previous values (could be old links or new IDs)
+  const prev = readJsonArray(filePath);
+
+  // Migrate: if we detect URLs, convert them to IDs
+  const migrated = prev.map(v => {
+    if (typeof v === 'string' && /^https?:\/\//i.test(v)) {
+      const id = getItemId(v);
+      return id || v;
+    }
+    return v;
+  });
+
+  const knownIds = new Set(migrated.filter(Boolean).map(String));
 
   const newItems = [];
   for (const item of items) {
-    if (item.link && !savedLinks.includes(item.link)) {
-      savedLinks.push(item.link);
+    const id = getItemId(item.link);
+    if (!id) continue;
+    if (!knownIds.has(id)) {
+      knownIds.add(id);
       newItems.push(item);
     }
   }
 
   if (newItems.length > 0) {
-    writeJson(filePath, savedLinks);
+    const idsToSave = Array.from(knownIds).slice(-5000); // keep last 5k
+    writeJson(filePath, idsToSave);
     createPushFlagForWorkflow();
   }
 
@@ -158,34 +198,27 @@ const createPushFlagForWorkflow = () => {
 // ================================
 // Telegram-safe batching by characters
 // ================================
-const MAX_CHARS = 3900; // stay safely below Telegram's ~4096 limit
+const MAX_CHARS = 3900;
 
 function shortenLink(u) {
   try {
     const url = new URL(u);
-    // Drop query to keep it short but clickable
     return url.origin + url.pathname;
   } catch {
     return String(u).split('?')[0];
   }
 }
 
-/**
- * Split a list of lines into chunks whose full message length (header + lines)
- * stays within MAX_CHARS. Keeps whole lines; never splits inside a line.
- */
 function chunkLinesByChars(lines, baseHeader, maxChars = MAX_CHARS) {
   const chunks = [];
   let curr = [];
-  let currLen = baseHeader.length + 2; // header + \n\n
+  let currLen = baseHeader.length + 2;
 
   for (const line of lines) {
-    const lineLen = line.length + 1; // + newline
-    // leave room (≈40 chars) for " (part X/Y)" suffix we add later
+    const lineLen = line.length + 1;
     const reserve = 40;
     if (currLen + lineLen > (maxChars - reserve)) {
       if (curr.length === 0) {
-        // single super-long line; hard truncate to fit
         const truncated = line.slice(0, maxChars - baseHeader.length - reserve - 10) + '…';
         chunks.push([truncated]);
         curr = [];
@@ -207,7 +240,6 @@ function chunkLinesByChars(lines, baseHeader, maxChars = MAX_CHARS) {
 async function notifyNewItems(telenode, chatId, newItems) {
   if (!newItems || newItems.length === 0) return;
 
-  // Keep messages short: only show the ad link (drop the image URL)
   const lines = newItems.map(it => `• ${shortenLink(it.link)}`);
 
   const baseHeader = `🆕 New items found (${newItems.length})`;
