@@ -358,16 +358,13 @@ const scrape = async (topic, url, pagesToScan, bootstrapIfEmpty = true) => {
   const telenode = new Telenode({ apiToken });
 
   try {
-    await safeSend(telenode, chatId, `Scanning **${topic}** across up to ${pagesToScan} page(s):\n${url}`);
-
+    
     const allItems = await collectItemsAcrossPages(url, pagesToScan);
     const newItems = await checkIfHasNewItem(allItems, topic, { bootstrapIfEmpty });
 
     if (newItems.length > 0) {
       await notifyNewItems(telenode, chatId, newItems);
-    } else {
-      await safeSend(telenode, chatId, 'No new items were added');
-    }
+    } 
   } catch (e) {
     const errMsg = e?.message ? `Error: ${e.message}` : 'Unknown error';
     try {
